@@ -923,6 +923,8 @@ function exportExcel() {
   if (addSummary) {
     const isAnswered = r => String(r.aiResponse ?? '').trim() !== '' && r.aiResponse !== '—';
 
+    const norm = v => String(v ?? '').trim().toLowerCase();
+
     const sumData = [
       [
         'Domain',
@@ -930,40 +932,46 @@ function exportExcel() {
         'Total Answered by AI',
         'Total Not Answered by AI',
         'Correct Responses of AI (against Manual Responses)',
-        'Accuracy (%)'
+        'Accuracy (%)',
+        'Manual Yes → AI No',
+        'Manual Yes → AI Partial'
       ]
     ];
 
-    let grandTotal = 0, grandAnswered = 0, grandNotAnswered = 0, grandCorrect = 0;
+    let grandTotal = 0, grandAnswered = 0, grandNotAnswered = 0, grandCorrect = 0, grandYesNo = 0, grandYesPartial = 0;
 
     for (const [domain, domainRows] of domainMap) {
-      const total      = domainRows.length;
-      const answered   = domainRows.filter(isAnswered).length;
+      const total       = domainRows.length;
+      const answered    = domainRows.filter(isAnswered).length;
       const notAnswered = total - answered;
-      const correct    = domainRows.filter(r => r.status === 'match').length;
-      const accuracy   = answered > 0 ? parseFloat((correct / answered * 100).toFixed(2)) : 0;
+      const correct     = domainRows.filter(r => r.status === 'match').length;
+      const accuracy    = answered > 0 ? parseFloat((correct / answered * 100).toFixed(2)) : 0;
+      const yesNo       = domainRows.filter(r => norm(r.manualResponse) === 'yes' && norm(r.aiResponse) === 'no').length;
+      const yesPartial  = domainRows.filter(r => norm(r.manualResponse) === 'yes' && norm(r.aiResponse) === 'partial').length;
 
-      sumData.push([domain, total, answered, notAnswered, correct, accuracy]);
+      sumData.push([domain, total, answered, notAnswered, correct, accuracy, yesNo, yesPartial]);
 
-      grandTotal      += total;
-      grandAnswered   += answered;
+      grandTotal       += total;
+      grandAnswered    += answered;
       grandNotAnswered += notAnswered;
-      grandCorrect    += correct;
+      grandCorrect     += correct;
+      grandYesNo       += yesNo;
+      grandYesPartial  += yesPartial;
     }
 
     const grandAccuracy = grandAnswered > 0
       ? parseFloat((grandCorrect / grandAnswered * 100).toFixed(2)) : 0;
 
-    sumData.push(['', '', '', '', '', '']);
-    sumData.push(['TOTAL', grandTotal, grandAnswered, grandNotAnswered, grandCorrect, grandAccuracy]);
+    sumData.push(['', '', '', '', '', '', '', '']);
+    sumData.push(['TOTAL', grandTotal, grandAnswered, grandNotAnswered, grandCorrect, grandAccuracy, grandYesNo, grandYesPartial]);
 
     const ws2 = XLSX.utils.aoa_to_sheet(sumData);
     ws2['!cols'] = [
-      { wch: 12 }, { wch: 16 }, { wch: 22 }, { wch: 26 }, { wch: 50 }, { wch: 14 }
+      { wch: 12 }, { wch: 16 }, { wch: 22 }, { wch: 26 }, { wch: 50 }, { wch: 14 }, { wch: 20 }, { wch: 22 }
     ];
 
     const lastRow = sumData.length;
-    ['A','B','C','D','E','F'].forEach(c => {
+    ['A','B','C','D','E','F','G','H'].forEach(c => {
       // Header row style
       const h = c + '1';
       if (ws2[h]) ws2[h].s = {
