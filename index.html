@@ -708,7 +708,8 @@ async function processSheets() {
         if (bestScore >= threshold) { matchedEntry = bestEntry; matchScore = bestScore; }
       }
 
-      const r2 = matchedEntry ? matchedEntry.response : null;
+      const r2Raw = matchedEntry ? matchedEntry.response : null;
+      const r2 = r2Raw !== null && normalize(r2Raw) === 'not attempted' ? 'No' : r2Raw;
       let status;
       if (r2 === null) status = 'unmatched';
       else if (normalize(r1) === normalize(r2)) status = 'match';
@@ -841,6 +842,12 @@ function buildDomainSheet(domainRows, highlight) {
   const ws = XLSX.utils.aoa_to_sheet(header.concat(rows));
   ws['!cols'] = [{ wch: 5 }, { wch: 15 }, { wch: 55 }, { wch: 22 }, { wch: 22 }, { wch: 12 }];
 
+  // Overwrite Comparison column (F) with IF formula; keep cached value so sheet opens correctly
+  domainRows.forEach((r, i) => {
+    const ri = i + 2;
+    ws[`F${ri}`] = { t: 'n', f: `IF(D${ri}=E${ri},1,0)`, v: r.status === 'match' ? 1 : 0 };
+  });
+
   // Header row style
   cols.forEach(c => {
     const addr = c + '1';
@@ -868,10 +875,12 @@ function buildDomainSheet(domainRows, highlight) {
     });
   }
 
-  // Total row
+  // Total row with COUNTIF formula
+  const lastDataRow = domainRows.length + 1;
   const totalMatched = domainRows.filter(r => r.status === 'match').length;
   const totalRowIdx = domainRows.length + 2;
   XLSX.utils.sheet_add_aoa(ws, [['', '', 'Total', '', '', totalMatched]], { origin: -1 });
+  ws[`F${totalRowIdx}`] = { t: 'n', f: `COUNTIF(F2:F${lastDataRow},1)`, v: totalMatched };
   cols.forEach(col => {
     const addr = col + totalRowIdx;
     if (!ws[addr]) ws[addr] = { v: '', t: 's' };
@@ -905,11 +914,14 @@ function exportExcel() {
     domainMap.get(r.domain).push(r);
   });
 
-  // One sheet per domain
+  // One sheet per domain — also collect info for summary cross-sheet formulas
   const usedNames = new Set();
+  const domainInfo = []; // { domain, sheetName, rowCount, cached: {...} }
+  const isAnswered = r => String(r.aiResponse ?? '').trim() !== '' && r.aiResponse !== '—';
+  const normV = v => String(v ?? '').trim().toLowerCase();
+
   for (const [domain, domainRows] of domainMap) {
     let sheetName = safeSheetName(domain);
-    // Deduplicate sheet names
     if (usedNames.has(sheetName)) {
       let n = 2;
       while (usedNames.has(sheetName + '_' + n)) n++;
@@ -917,70 +929,86 @@ function exportExcel() {
     }
     usedNames.add(sheetName);
     XLSX.utils.book_append_sheet(wb, buildDomainSheet(domainRows, highlight), sheetName);
+
+    // Pre-compute cached values for summary (used as fallback v in formula cells)
+    const total       = domainRows.length;
+    const answered    = domainRows.filter(isAnswered).length;
+    const notAnswered = total - answered;
+    const correct     = domainRows.filter(r => r.status === 'match').length;
+    const accuracy    = answered > 0 ? parseFloat((correct / answered * 100).toFixed(2)) : 0;
+    const yesNo       = domainRows.filter(r => normV(r.manualResponse) === 'yes' && normV(r.aiResponse) === 'no').length;
+    const yesPartial  = domainRows.filter(r => normV(r.manualResponse) === 'yes' && normV(r.aiResponse) === 'partial').length;
+    domainInfo.push({ domain, sheetName, rowCount: total, cached: { total, answered, notAnswered, correct, accuracy, yesNo, yesPartial } });
   }
 
-  // Summary sheet
+  // Summary sheet with formulas referencing each domain sheet
   if (addSummary) {
-    const isAnswered = r => String(r.aiResponse ?? '').trim() !== '' && r.aiResponse !== '—';
-
-    const norm = v => String(v ?? '').trim().toLowerCase();
-
-    const sumData = [
-      [
-        'Domain',
-        'Total Questions',
-        'Total Answered by AI',
-        'Total Not Answered by AI',
-        'Correct Responses of AI (against Manual Responses)',
-        'Accuracy (%)',
-        'Manual Yes → AI No',
-        'Manual Yes → AI Partial'
-      ]
+    const sumHeaders = [
+      'Domain', 'Total Questions', 'Total Answered by AI', 'Total Not Answered by AI',
+      'Correct Responses of AI (against Manual Responses)', 'Accuracy (%)',
+      'Manual Yes → AI No', 'Manual Yes → AI Partial'
     ];
 
-    let grandTotal = 0, grandAnswered = 0, grandNotAnswered = 0, grandCorrect = 0, grandYesNo = 0, grandYesPartial = 0;
-
-    for (const [domain, domainRows] of domainMap) {
-      const total       = domainRows.length;
-      const answered    = domainRows.filter(isAnswered).length;
-      const notAnswered = total - answered;
-      const correct     = domainRows.filter(r => r.status === 'match').length;
-      const accuracy    = answered > 0 ? parseFloat((correct / answered * 100).toFixed(2)) : 0;
-      const yesNo       = domainRows.filter(r => norm(r.manualResponse) === 'yes' && norm(r.aiResponse) === 'no').length;
-      const yesPartial  = domainRows.filter(r => norm(r.manualResponse) === 'yes' && norm(r.aiResponse) === 'partial').length;
-
-      sumData.push([domain, total, answered, notAnswered, correct, accuracy, yesNo, yesPartial]);
-
-      grandTotal       += total;
-      grandAnswered    += answered;
-      grandNotAnswered += notAnswered;
-      grandCorrect     += correct;
-      grandYesNo       += yesNo;
-      grandYesPartial  += yesPartial;
-    }
-
-    const grandAccuracy = grandAnswered > 0
-      ? parseFloat((grandCorrect / grandAnswered * 100).toFixed(2)) : 0;
-
+    // Build with cached values first so sheet opens correctly before Excel recalculates
+    const sumData = [sumHeaders];
+    domainInfo.forEach(d => {
+      const c = d.cached;
+      sumData.push([d.domain, c.total, c.answered, c.notAnswered, c.correct, c.accuracy, c.yesNo, c.yesPartial]);
+    });
+    const blankRowIdx = domainInfo.length + 2; // 1-based
+    const totalRowIdx = domainInfo.length + 3;
     sumData.push(['', '', '', '', '', '', '', '']);
-    sumData.push(['TOTAL', grandTotal, grandAnswered, grandNotAnswered, grandCorrect, grandAccuracy, grandYesNo, grandYesPartial]);
+
+    // Grand cached totals for TOTAL row
+    let gTotal = 0, gAnswered = 0, gNotAnswered = 0, gCorrect = 0, gYesNo = 0, gYesPartial = 0;
+    domainInfo.forEach(d => {
+      gTotal += d.cached.total; gAnswered += d.cached.answered; gNotAnswered += d.cached.notAnswered;
+      gCorrect += d.cached.correct; gYesNo += d.cached.yesNo; gYesPartial += d.cached.yesPartial;
+    });
+    const gAccuracy = gAnswered > 0 ? parseFloat((gCorrect / gAnswered * 100).toFixed(2)) : 0;
+    sumData.push(['TOTAL', gTotal, gAnswered, gNotAnswered, gCorrect, gAccuracy, gYesNo, gYesPartial]);
 
     const ws2 = XLSX.utils.aoa_to_sheet(sumData);
+
+    // Overwrite data rows with cross-sheet formulas
+    domainInfo.forEach((d, i) => {
+      const row   = i + 2;              // summary row (1=header, 2=first domain)
+      const sn    = `'${d.sheetName}'`; // quoted sheet name for cross-ref
+      const last  = d.rowCount + 1;     // last data row in domain sheet (rows 2..last)
+      const tRow  = d.rowCount + 2;     // Total row index in domain sheet
+      const c     = d.cached;
+
+      ws2[`B${row}`] = { t: 'n', f: `COUNTA(${sn}!C2:C${last})`,                                           v: c.total };
+      ws2[`C${row}`] = { t: 'n', f: `COUNTIF(${sn}!D2:D${last},"<>")`,                                     v: c.answered };
+      ws2[`D${row}`] = { t: 'n', f: `B${row}-C${row}`,                                                      v: c.notAnswered };
+      ws2[`E${row}`] = { t: 'n', f: `${sn}!F${tRow}`,                                                       v: c.correct };
+      ws2[`F${row}`] = { t: 'n', f: `IF(C${row}=0,0,ROUND(E${row}/C${row}*100,2))`,                        v: c.accuracy };
+      ws2[`G${row}`] = { t: 'n', f: `COUNTIFS(${sn}!E2:E${last},"Yes",${sn}!D2:D${last},"No")`,            v: c.yesNo };
+      ws2[`H${row}`] = { t: 'n', f: `COUNTIFS(${sn}!E2:E${last},"Yes",${sn}!D2:D${last},"Partial")`,       v: c.yesPartial };
+    });
+
+    // TOTAL row formulas — SUM across all domain rows
+    const lastDomainRow = domainInfo.length + 1; // last domain data row in summary
+    ws2[`B${totalRowIdx}`] = { t: 'n', f: `SUM(B2:B${lastDomainRow})`,                                      v: gTotal };
+    ws2[`C${totalRowIdx}`] = { t: 'n', f: `SUM(C2:C${lastDomainRow})`,                                      v: gAnswered };
+    ws2[`D${totalRowIdx}`] = { t: 'n', f: `SUM(D2:D${lastDomainRow})`,                                      v: gNotAnswered };
+    ws2[`E${totalRowIdx}`] = { t: 'n', f: `SUM(E2:E${lastDomainRow})`,                                      v: gCorrect };
+    ws2[`F${totalRowIdx}`] = { t: 'n', f: `IF(C${totalRowIdx}=0,0,ROUND(E${totalRowIdx}/C${totalRowIdx}*100,2))`, v: gAccuracy };
+    ws2[`G${totalRowIdx}`] = { t: 'n', f: `SUM(G2:G${lastDomainRow})`,                                      v: gYesNo };
+    ws2[`H${totalRowIdx}`] = { t: 'n', f: `SUM(H2:H${lastDomainRow})`,                                      v: gYesPartial };
+
     ws2['!cols'] = [
       { wch: 12 }, { wch: 16 }, { wch: 22 }, { wch: 26 }, { wch: 50 }, { wch: 14 }, { wch: 20 }, { wch: 22 }
     ];
 
-    const lastRow = sumData.length;
     ['A','B','C','D','E','F','G','H'].forEach(c => {
-      // Header row style
       const h = c + '1';
       if (ws2[h]) ws2[h].s = {
         fill: { fgColor: { rgb: '22263A' } },
         font: { bold: true, color: { rgb: 'E8EAF6' } },
         alignment: { wrapText: true, horizontal: 'center' }
       };
-      // Total row style
-      const t = c + lastRow;
+      const t = c + totalRowIdx;
       if (ws2[t]) ws2[t].s = {
         fill: { fgColor: { rgb: '22263A' } },
         font: { bold: true, color: { rgb: 'E8EAF6' } }
